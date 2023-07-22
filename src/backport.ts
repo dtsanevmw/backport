@@ -136,6 +136,15 @@ const backportOnce = async ({
           : [author],
     },
   );
+  await github.request(
+    "POST /repos/{owner}/{repo}/issues/{issue_number}/assignees",
+    {
+      issue_number: number,
+      assignees: [author],
+      owner,
+      repo,
+    },
+  );
   if (labels.length > 0) {
     await github.request(
       "PUT /repos/{owner}/{repo}/issues/{issue_number}/labels",
@@ -288,7 +297,7 @@ const backport = async ({
     const labels = originalLabels
       .map((label) => label.name)
       .filter((label) => !labelRegExp.test(label));
-    labels.push(`backported-to-${base}`);
+    labels.push("backport");
 
     const title = getTitle({ base, number, title: originalTitle });
     const merged_by = originalMergedBy?.login ?? "";

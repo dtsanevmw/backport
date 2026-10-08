@@ -4,6 +4,14 @@ module.exports = {
   extends: ["prettier"],
   overrides: [
     {
+      files: "**/*.test.ts",
+      rules: {
+        // The bundled typescript-eslint cannot resolve node:test's types and its describe/it return promises the runner handles.
+        "@typescript-eslint/no-floating-promises": "off",
+        "@typescript-eslint/no-unsafe-call": "off",
+      },
+    },
+    {
       files: "**/*.ts",
       rules: {
         // Index signatures are slightly more legible since the key must be named.

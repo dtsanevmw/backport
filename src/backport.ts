@@ -139,8 +139,8 @@ const backportOnce = async ({
   await github.request(
     "POST /repos/{owner}/{repo}/issues/{issue_number}/assignees",
     {
-      issue_number: number,
       assignees: [author],
+      issue_number: number,
       owner,
       repo,
     },

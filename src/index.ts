@@ -16,6 +16,13 @@ const run = async () => {
     const labelPattern = getInput("label_pattern");
     const labelRegExp = new RegExp(labelPattern);
 
+    const conflictResolution = getInput("conflict_resolution") || "fail";
+    if (conflictResolution !== "fail" && conflictResolution !== "draft") {
+      throw new Error(
+        `Unsupported conflict_resolution "${conflictResolution}": use "fail" or "draft".`,
+      );
+    }
+
     const token = getInput("github_token", { required: true });
     setSecret(token);
 
@@ -32,6 +39,7 @@ const run = async () => {
     }
 
     const { created, failed } = await backport({
+      conflictResolution,
       getBody,
       getHead,
       getTitle,

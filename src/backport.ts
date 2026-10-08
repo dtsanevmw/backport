@@ -3,22 +3,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { env } from "node:process";
 import { group, info, error as logError, warning } from "@actions/core";
-import { exec } from "@actions/exec";
 import { getOctokit } from "@actions/github";
-import type { GitHub } from "@actions/github/lib/utils.js";
 import type {
   PullRequestClosedEvent,
   PullRequestLabeledEvent,
 } from "@octokit/webhooks-types";
 import ensureError from "ensure-error";
 import { compact } from "lodash-es";
+import {
+  getConflictsNotice,
+  getFailureCommentBody,
+  getSuccessCommentBody,
+  upsertStatusComment,
+} from "./comments.js";
+import type { Git } from "./git.js";
+import { createGit, getConflictedFiles } from "./git.js";
+import type { Github } from "./github.js";
 
-type Github = InstanceType<typeof GitHub>;
+type ConflictResolution = "draft" | "fail";
 
-type Git = (
-  args: string[],
-  options?: Readonly<{ ignoreReturnCode?: boolean }>,
-) => Promise<number>;
+type Target = Readonly<{ base: string; label: string }>;
 
 // A conservative subset of what `git check-ref-format --branch` accepts.
 // It keeps option-looking values out of git's arguments and shell metacharacters out of the manual backport instructions.
@@ -41,10 +45,10 @@ const assertSafeBranchName = (name: string, origin: string) => {
   }
 };
 
-const getBaseBranchFromLabel = (
+const getTargetFromLabel = (
   label: string,
   labelRegExp: RegExp,
-): string | undefined => {
+): Target | undefined => {
   const result = labelRegExp.exec(label);
 
   if (!result || !result.groups) {
@@ -63,24 +67,24 @@ const getBaseBranchFromLabel = (
 
   assertSafeBranchName(base, `from label "${label}"`);
 
-  return base;
+  return { base, label };
 };
 
-const getBaseBranches = ({
+const getTargets = ({
   labelRegExp,
   payload,
 }: Readonly<{
   labelRegExp: RegExp;
   payload: PullRequestClosedEvent | PullRequestLabeledEvent;
-}>): string[] => {
+}>): Target[] => {
   if ("label" in payload) {
-    const base = getBaseBranchFromLabel(payload.label.name, labelRegExp);
-    return base ? [base] : [];
+    const target = getTargetFromLabel(payload.label.name, labelRegExp);
+    return target ? [target] : [];
   }
 
   return compact(
     payload.pull_request.labels.map((label) =>
-      getBaseBranchFromLabel(label.name, labelRegExp),
+      getTargetFromLabel(label.name, labelRegExp),
     ),
   );
 };
@@ -105,35 +109,178 @@ const bestEffort = async (description: string, run: () => Promise<unknown>) => {
   }
 };
 
-const warnIfSquashIsNotTheOnlyAllowedMergeMethod = async ({
+/**
+ * Picks what to cherry-pick depending on how the PR was merged:
+ * - merge commit: the merge commit against its first parent, which brings all the PR's changes at once.
+ * - rebase and merge: every rebased commit, recognized by their messages matching the PR's commits.
+ * - squash and merge: the single squashed commit.
+ */
+const getCherryPickArgs = ({
+  mergeCommitSha,
+  mergedMessages,
+  parentCount,
+  pullRequestMessages,
+}: Readonly<{
+  mergeCommitSha: string;
+  // Messages of the commits ending at the merge commit, oldest first.
+  mergedMessages: readonly string[];
+  parentCount: number;
+  // Messages of the PR's commits, oldest first.
+  pullRequestMessages: readonly string[];
+}>): string[] => {
+  if (parentCount > 1) {
+    return ["--mainline", "1", mergeCommitSha];
+  }
+
+  const commitCount = pullRequestMessages.length;
+  const isRebased =
+    commitCount > 1 &&
+    mergedMessages.length === commitCount &&
+    mergedMessages.every(
+      (message, index) => message.trim() === pullRequestMessages[index]?.trim(),
+    );
+
+  return isRebased
+    ? [`${mergeCommitSha}~${commitCount}..${mergeCommitSha}`]
+    : [mergeCommitSha];
+};
+
+const resolveCherryPickArgs = async ({
+  commitCount,
+  git,
   github,
+  mergeCommitSha,
+  number,
   owner,
   repo,
-}: {
+}: Readonly<{
+  commitCount: number;
+  git: Git;
   github: Github;
+  mergeCommitSha: string;
+  number: number;
   owner: string;
   repo: string;
-}) => {
-  const {
-    data: { allow_merge_commit, allow_rebase_merge },
-  } = await github.request("GET /repos/{owner}/{repo}", { owner, repo });
-  if (allow_merge_commit || allow_rebase_merge) {
-    warning(
-      [
-        "Your repository allows merge commits and rebase merging.",
-        " However, Backport only supports rebased and merged pull requests with a single commit and squashed and merged pull requests.",
-        " Consider only allowing squash merging.",
-        " See https://help.github.com/en/github/administering-a-repository/about-merge-methods-on-github for more information.",
-      ].join("\n"),
+}>): Promise<string[]> => {
+  const { stdout: parents } = await git([
+    "rev-list",
+    "--parents",
+    "--max-count=1",
+    mergeCommitSha,
+  ]);
+  const parentCount = parents.trim().split(" ").length - 1;
+
+  if (parentCount > 1 || commitCount <= 1) {
+    return getCherryPickArgs({
+      mergeCommitSha,
+      mergedMessages: [],
+      parentCount,
+      pullRequestMessages: [],
+    });
+  }
+
+  const pullRequestCommits = await github.paginate(
+    "GET /repos/{owner}/{repo}/pulls/{pull_number}/commits",
+    { owner, per_page: 100, pull_number: number, repo },
+  );
+  const { stdout: log } = await git([
+    "log",
+    "--format=%B%x00",
+    "--reverse",
+    `--max-count=${pullRequestCommits.length}`,
+    mergeCommitSha,
+  ]);
+
+  return getCherryPickArgs({
+    mergeCommitSha,
+    mergedMessages: log
+      .split("\0")
+      .map((message) => message.trim())
+      .filter(Boolean),
+    parentCount,
+    pullRequestMessages: pullRequestCommits.map(({ commit }) => commit.message),
+  });
+};
+
+/**
+ * Cherry-picks the changes on the current branch.
+ * With the "draft" conflict resolution, conflicts are committed with their markers and the conflicted files are returned.
+ */
+const cherryPick = async ({
+  cherryPickArgs,
+  conflictResolution,
+  git,
+}: Readonly<{
+  cherryPickArgs: readonly string[];
+  conflictResolution: ConflictResolution;
+  git: Git;
+}>): Promise<string[]> => {
+  const abort = async () => {
+    await git(["cherry-pick", "--abort"], { ignoreReturnCode: true });
+  };
+
+  let result = await git(["cherry-pick", "-x", ...cherryPickArgs], {
+    ignoreReturnCode: true,
+  });
+  const conflicts = new Set<string>();
+
+  while (result.exitCode !== 0) {
+    // eslint-disable-next-line no-await-in-loop
+    const conflictedFiles = await getConflictedFiles(git);
+
+    if (conflictedFiles.length === 0) {
+      // eslint-disable-next-line no-await-in-loop
+      await abort();
+      throw new Error(
+        `\`git cherry-pick\` failed:\n${(
+          result.stderr || result.stdout
+        ).trim()}`,
+      );
+    }
+
+    if (conflictResolution === "fail") {
+      // eslint-disable-next-line no-await-in-loop
+      await abort();
+      throw new Error(
+        `The cherry-pick has conflicts in:\n${conflictedFiles
+          .map((file) => `- ${file}`)
+          .join("\n")}`,
+      );
+    }
+
+    for (const file of conflictedFiles) {
+      conflicts.add(file);
+    }
+
+    // eslint-disable-next-line no-await-in-loop
+    await git(["add", "--all"]);
+    // Continuing moves on to the next commit of a range, which can conflict too.
+    // eslint-disable-next-line no-await-in-loop
+    result = await git(
+      ["-c", "core.editor=true", "cherry-pick", "--continue"],
+      {
+        ignoreReturnCode: true,
+      },
     );
   }
+
+  return [...conflicts];
+};
+
+const remoteBranchExists = async (git: Git, branch: string) => {
+  const { exitCode } = await git(
+    ["ls-remote", "--exit-code", "--heads", "origin", branch],
+    { ignoreReturnCode: true },
+  );
+  return exitCode === 0;
 };
 
 const backportOnce = async ({
   author,
   base,
   body,
-  commitSha,
+  cherryPickArgs,
+  conflictResolution,
   git,
   github,
   head,
@@ -146,7 +293,8 @@ const backportOnce = async ({
   author: string;
   base: string;
   body: string;
-  commitSha: string;
+  cherryPickArgs: readonly string[];
+  conflictResolution: ConflictResolution;
   git: Git;
   github: Github;
   head: string;
@@ -155,7 +303,7 @@ const backportOnce = async ({
   owner: string;
   repo: string;
   title: string;
-}>): Promise<number> => {
+}>): Promise<{ conflicts: string[]; number: number }> => {
   const { data: existingPullRequests } = await github.request(
     "GET /repos/{owner}/{repo}/pulls",
     { base, head: `${owner}:${head}`, owner, repo, state: "open" },
@@ -163,41 +311,59 @@ const backportOnce = async ({
   const [existingPullRequest] = existingPullRequests;
   if (existingPullRequest) {
     info(`PR #${existingPullRequest.number} already backports to ${base}.`);
-    return existingPullRequest.number;
+    return { conflicts: [], number: existingPullRequest.number };
   }
 
-  const remoteBranchExists =
-    (await git(["ls-remote", "--exit-code", "--heads", "origin", head], {
-      ignoreReturnCode: true,
-    })) === 0;
+  let conflicts: string[] = [];
 
-  if (remoteBranchExists) {
+  if (await remoteBranchExists(git, head)) {
     // Left over from a previous run that failed after pushing: reuse it instead of failing to push a new cherry-pick.
     info(`Branch ${head} already exists, reusing it.`);
   } else {
+    if (!(await remoteBranchExists(git, base))) {
+      throw new Error(`The \`${base}\` branch doesn't exist.`);
+    }
+
     await git(["switch", base]);
     await git(["switch", "--create", head]);
-    try {
-      await git(["cherry-pick", "-x", commitSha]);
-    } catch (error: unknown) {
-      // Aborting fails when the cherry-pick did not start, which must not hide the original error.
-      await git(["cherry-pick", "--abort"], { ignoreReturnCode: true });
+    conflicts = await cherryPick({ cherryPickArgs, conflictResolution, git });
+    await git(["push", "--set-upstream", "origin", head]);
+  }
+
+  const draft = conflicts.length > 0;
+  const createPullRequest = async (asDraft: boolean) =>
+    github.request("POST /repos/{owner}/{repo}/pulls", {
+      base,
+      body: draft
+        ? `${getConflictsNotice({ conflicts, head })}\n\n${body}`
+        : body,
+      draft: asDraft,
+      head,
+      owner,
+      repo,
+      title,
+    });
+
+  let response;
+  try {
+    response = await createPullRequest(draft);
+  } catch (error: unknown) {
+    if (!draft) {
       throw error;
     }
 
-    await git(["push", "--set-upstream", "origin", head]);
+    // Draft PRs aren't available on every plan.
+    warning(
+      `Could not create a draft PR, creating a regular one: ${
+        ensureError(error).message
+      }`,
+    );
+    response = await createPullRequest(false);
   }
 
   const {
     data: { number },
-  } = await github.request("POST /repos/{owner}/{repo}/pulls", {
-    base,
-    body,
-    head,
-    owner,
-    repo,
-    title,
-  });
+  } = response;
   info(`PR #${number} has been created.`);
 
   const reviewers = getReviewers({ author, mergedBy });
@@ -228,50 +394,11 @@ const backportOnce = async ({
     );
   }
 
-  return number;
-};
-
-const getFailedBackportCommentBody = ({
-  base,
-  commitSha,
-  errorMessage,
-  head,
-}: {
-  base: string;
-  commitSha: string;
-  errorMessage: string;
-  head: string;
-}) => {
-  const worktreePath = `.worktrees/backport-${base}`;
-  return [
-    `The backport to \`${base}\` failed:`,
-    "```",
-    errorMessage,
-    "```",
-    "To backport manually, run these commands in your terminal:",
-    "```bash",
-    "# Fetch latest updates from GitHub",
-    "git fetch",
-    "# Create a new working tree",
-    `git worktree add ${worktreePath} ${base}`,
-    "# Navigate to the new working tree",
-    `cd ${worktreePath}`,
-    "# Create a new branch",
-    `git switch --create ${head}`,
-    "# Cherry-pick the merged commit of this pull request and resolve the conflicts",
-    `git cherry-pick -x --mainline 1 ${commitSha}`,
-    "# Push it to GitHub",
-    `git push --set-upstream origin ${head}`,
-    "# Go back to the original working tree",
-    "cd ../..",
-    "# Delete the working tree",
-    `git worktree remove ${worktreePath}`,
-    "```",
-    `Then, create a pull request where the \`base\` branch is \`${base}\` and the \`compare\`/\`head\` branch is \`${head}\`.`,
-  ].join("\n");
+  return { conflicts, number };
 };
 
 const backport = async ({
+  conflictResolution,
   getBody,
   getHead,
   getTitle,
@@ -279,6 +406,7 @@ const backport = async ({
   payload,
   token,
 }: {
+  conflictResolution: ConflictResolution;
   getBody: (
     props: Readonly<{
       base: string;
@@ -310,6 +438,7 @@ const backport = async ({
   const {
     pull_request: {
       body: originalBody,
+      commits: commitCount,
       labels: originalLabels,
       merge_commit_sha: mergeCommitSha,
       merged,
@@ -319,6 +448,7 @@ const backport = async ({
       user: { login: author },
     },
     repository: {
+      html_url: repositoryUrl,
       name: repo,
       owner: { login: owner },
     },
@@ -331,16 +461,14 @@ const backport = async ({
     );
   }
 
-  const baseBranches = getBaseBranches({ labelRegExp, payload });
+  const targets = getTargets({ labelRegExp, payload });
 
-  if (baseBranches.length === 0) {
+  if (targets.length === 0) {
     info("No backports required.");
     return { created: {}, failed: [] };
   }
 
   const github = getOctokit(token);
-
-  await warnIfSquashIsNotTheOnlyAllowedMergeMethod({ github, owner, repo });
 
   info(`Backporting ${mergeCommitSha} from #${number}.`);
 
@@ -350,11 +478,11 @@ const backport = async ({
 
   // A fresh directory so that the cleanup below can never delete anything the workflow put in its workspace.
   const cwd = await mkdtemp(join(env.RUNNER_TEMP ?? tmpdir(), "backport-"));
-  const git: Git = async (args, { ignoreReturnCode = false } = {}) =>
-    exec("git", args, { cwd, ignoreReturnCode });
+  const git = createGit({ cwd, secrets: [token] });
 
   const created: { [base: string]: number } = {};
   const failed: string[] = [];
+  const originalLabelNames = originalLabels.map((label) => label.name);
 
   try {
     await git(["clone", cloneUrl.toString(), "."]);
@@ -366,7 +494,18 @@ const backport = async ({
     ]);
     await git(["config", "user.name", "github-actions[bot]"]);
 
-    for (const base of baseBranches) {
+    const cherryPickArgs = await resolveCherryPickArgs({
+      commitCount,
+      git,
+      github,
+      mergeCommitSha,
+      number,
+      owner,
+      repo,
+    });
+    info(`Cherry-picking ${cherryPickArgs.join(" ")}.`);
+
+    for (const { base, label } of targets) {
       const body = getBody({
         base,
         body: originalBody ?? "",
@@ -374,24 +513,27 @@ const backport = async ({
         number,
       });
       const head = getHead({ base, number });
-      const labels = originalLabels
-        .map((label) => label.name)
-        .filter((label) => !labelRegExp.test(label));
+      const labels = originalLabelNames.filter(
+        (name) =>
+          !labelRegExp.test(name) && !name.startsWith("failed-backport-to-"),
+      );
       labels.push("backport");
 
       const title = getTitle({ base, number, title: originalTitle });
       const mergedBy = originalMergedBy?.login ?? "";
+      const failedLabel = `failed-backport-to-${base}`;
 
       // PRs are handled sequentially to avoid breaking GitHub's log grouping feature.
       // eslint-disable-next-line no-await-in-loop
       await group(`Backporting to ${base} on ${head}.`, async () => {
         try {
           assertSafeBranchName(head, "from head_template");
-          created[base] = await backportOnce({
+          const { conflicts, number: backportNumber } = await backportOnce({
             author,
             base,
             body,
-            commitSha: mergeCommitSha,
+            cherryPickArgs,
+            conflictResolution,
             git,
             github,
             head,
@@ -401,31 +543,67 @@ const backport = async ({
             repo,
             title,
           });
+          created[base] = backportNumber;
+
+          if (conflicts.length > 0) {
+            warning(
+              `PR #${backportNumber} is a draft with conflicts in: ${conflicts.join(
+                ", ",
+              )}.`,
+            );
+          }
+
+          await bestEffort("report the backport", async () =>
+            upsertStatusComment({
+              base,
+              body: getSuccessCommentBody({
+                base,
+                conflicts,
+                number: backportNumber,
+              }),
+              github,
+              number,
+              owner,
+              repo,
+            }),
+          );
+
+          if (originalLabelNames.includes(failedLabel)) {
+            await bestEffort(`remove the ${failedLabel} label`, async () =>
+              github.request(
+                "DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{name}",
+                { issue_number: number, name: failedLabel, owner, repo },
+              ),
+            );
+          }
         } catch (_error: unknown) {
           const error = ensureError(_error);
           logError(error);
           failed.push(base);
 
           await bestEffort("report the failed backport", async () => {
-            await github.request(
-              "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
-              {
-                body: getFailedBackportCommentBody({
-                  base,
-                  commitSha: mergeCommitSha,
-                  errorMessage: error.message,
-                  head,
-                }),
-                issue_number: number,
-                owner,
-                repo,
-              },
-            );
+            await upsertStatusComment({
+              base,
+              body: getFailureCommentBody({
+                base,
+                body,
+                cherryPickArgs,
+                errorMessage: error.message,
+                head,
+                label,
+                repositoryUrl,
+                title,
+              }),
+              github,
+              number,
+              owner,
+              repo,
+            });
             await github.request(
               "POST /repos/{owner}/{repo}/issues/{issue_number}/labels",
               {
                 issue_number: number,
-                labels: [`failed-backport-to-${base}`],
+                labels: [failedLabel],
                 owner,
                 repo,
               },
@@ -445,8 +623,11 @@ const backport = async ({
 export {
   backport,
   backportOnce,
-  getBaseBranches,
+  cherryPick,
+  getCherryPickArgs,
   getReviewers,
+  getTargets,
   isSafeBranchName,
+  resolveCherryPickArgs,
 };
-export type { Git, Github };
+export type { ConflictResolution };

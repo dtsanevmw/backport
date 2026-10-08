@@ -12,7 +12,13 @@ inputs:
         - body: original PR's body
         - mergeCommitSha: SHA of the original PR's merge commit
         - number: original PR's number
-    default: "Backport <%= mergeCommitSha %> from #<%= number %>. <br> <%= body %>"
+    default: "Backport <%= mergeCommitSha %> from #<%= number %>.\n\n<%= body %>"
+  conflict_resolution:
+    description: >
+      What to do when the cherry-pick has conflicts.
+        - fail: don't create the backport PR and comment on the original PR with instructions to backport manually.
+        - draft: commit the conflict markers and create the backport PR as a draft so that the conflicts can be resolved there.
+    default: draft
   github_token:
     description: Token for the GitHub API.
     required: true

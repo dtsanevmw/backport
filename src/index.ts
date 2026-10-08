@@ -1,4 +1,4 @@
-import { getInput, setFailed, setOutput } from "@actions/core";
+import { getInput, setFailed, setOutput, setSecret } from "@actions/core";
 import { context } from "@actions/github";
 import type { PullRequestEvent } from "@octokit/webhooks-types";
 import ensureError from "ensure-error";
@@ -17,6 +17,7 @@ const run = async () => {
     const labelRegExp = new RegExp(labelPattern);
 
     const token = getInput("github_token", { required: true });
+    setSecret(token);
 
     if (!context.payload.pull_request) {
       throw new Error(`Unsupported event action: ${context.payload.action}.`);
@@ -30,7 +31,7 @@ const run = async () => {
       );
     }
 
-    const createdPullRequestBaseBranchToNumber = await backport({
+    const { created, failed } = await backport({
       getBody,
       getHead,
       getTitle,
@@ -38,10 +39,11 @@ const run = async () => {
       payload,
       token,
     });
-    setOutput(
-      "created_pull_requests",
-      JSON.stringify(createdPullRequestBaseBranchToNumber),
-    );
+    setOutput("created_pull_requests", JSON.stringify(created));
+
+    if (failed.length > 0) {
+      throw new Error(`Backport failed for: ${failed.join(", ")}.`);
+    }
   } catch (_error: unknown) {
     const error = ensureError(_error);
     setFailed(error);

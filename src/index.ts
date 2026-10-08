@@ -16,7 +16,7 @@ const run = async () => {
     const labelPattern = getInput("label_pattern");
     const labelRegExp = new RegExp(labelPattern);
 
-    const conflictResolution = getInput("conflict_resolution") || "fail";
+    const conflictResolution = getInput("conflict_resolution") || "draft";
     if (conflictResolution !== "fail" && conflictResolution !== "draft") {
       throw new Error(
         `Unsupported conflict_resolution "${conflictResolution}": use "fail" or "draft".`,

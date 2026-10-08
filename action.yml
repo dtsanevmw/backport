@@ -18,7 +18,7 @@ inputs:
       What to do when the cherry-pick has conflicts.
         - fail: don't create the backport PR and comment on the original PR with instructions to backport manually.
         - draft: commit the conflict markers and create the backport PR as a draft so that the conflicts can be resolved there.
-    default: fail
+    default: draft
   github_token:
     description: Token for the GitHub API.
     required: true

@@ -136,6 +136,10 @@ describe("default templates", async () => {
     );
   });
 
+  it("creates draft PRs on conflicts by default", () => {
+    assert.match(actionYml, /conflict_resolution:[\s\S]*?default: draft\n/);
+  });
+
   it("keeps the original title verbatim", () => {
     assert.equal(
       getDefault("title_template")({
